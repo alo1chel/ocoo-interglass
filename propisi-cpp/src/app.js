@@ -99,7 +99,7 @@
     s.done = s.done && typeof s.done === 'object' ? s.done : {};
     s.drafts = s.drafts && typeof s.drafts === 'object' ? s.drafts : {};
     s.my = Array.isArray(s.my) ? s.my : [];
-    s.settings = Object.assign({ level: 'novice', auto: true, size: window.innerWidth < 520 ? 1 : 2 }, s.settings || {});
+    s.settings = Object.assign({ level: 'novice', auto: true, size: window.innerWidth < 520 ? 1 : 2, model: 'opus' }, s.settings || {});
     s.fresh = fresh;
     return s;
   })();
@@ -281,7 +281,8 @@
       concepts: (Array.isArray(d.concepts) ? d.concepts : []).map(function (t) { return str(t, 40); }).filter(Boolean).slice(0, 6),
       request: str(request != null ? request : d.request, 400),
       createdAt: typeof d.createdAt === 'number' ? d.createdAt : Date.now(),
-      generated: true
+      generated: true,
+      by: d.by && typeof d.by.name === 'string' ? { name: d.by.name.slice(0, 80), fem: !!d.by.fem } : null
     };
   }
 
@@ -327,8 +328,13 @@
     '        <button type="button" role="radio" id="lvlNovice" data-level="novice">Я новичок</button>',
     '        <button type="button" role="radio" id="lvlSome" data-level="some">Немного знаю</button>',
     '      </div>',
-    '      <div class="ideas" id="ideas"><span class="ideas-label">Идеи:</span></div>',
+    '      <div class="model-pick" id="modelPick" hidden>',
+    '        <span class="model-label" id="modelLabel">Модель Claude:</span>',
+    '        <div class="model-seg" id="modelSeg" role="radiogroup" aria-labelledby="modelLabel"></div>',
+    '      </div>',
     '    </div>',
+    '    <p class="model-note" id="modelNote" hidden></p>',
+    '    <div class="ideas" id="ideas"><span class="ideas-label">Идеи:</span></div>',
     '    <p class="req-status" id="reqStatus" aria-live="polite"></p>',
     '  </form>',
     '  <div class="lesson" id="lesson">',
@@ -1046,20 +1052,88 @@
 
   /* ---------------------------------------------------------------- Claude */
 
+  // Модели для переключателя. Если выбранная модель зрителю недоступна,
+  // платформа отвечает моделью того же уровня (modelTier) — страница показывает, кто ответил.
+  var MODELS = {
+    haiku: { id: 'claude-haiku-5-5', tier: 'quick', label: 'Haiku 5.5',
+      note: 'Haiku 5.5 — самая быстрая: отвечает почти сразу. Для коротких программ её хватает, в длинных она чаще ошибается.' },
+    sonnet: { id: 'claude-sonnet-5-5', tier: 'default', label: 'Sonnet 5.5',
+      note: 'Sonnet 5.5 — баланс скорости и качества: урок обычно готов меньше чем за минуту.' },
+    opus: { id: 'claude-opus-5-5', tier: 'complex', label: 'Opus 5.5',
+      note: 'Opus 5.5 — сильная модель: точнее код и объяснения. Думает дольше и тратит больше лимита Claude.' },
+    fable: { id: 'claude-fable-5-2', tier: 'complex', label: 'Fable 5.2',
+      note: 'Fable 5.2 — самая мощная модель Anthropic. Может думать несколько минут и тратит больше всего лимита; для простых уроков обычно не нужна.' },
+    inherit: { inherit: true, tier: 'inherit', label: 'Как в Claude',
+      note: 'Отвечает модель, которая выбрана у тебя в приложении Claude.' }
+  };
+  var MODEL_ORDER = ['haiku', 'sonnet', 'opus', 'fable', 'inherit'];
+  var TIER_NAMES = { quick: 'Haiku', default: 'Sonnet', complex: 'Opus' };
+
+  function modelAvailable(k) {
+    var m = MODELS[k];
+    if (!m) return false;
+    if (m.inherit) return !!(AI.tiers && AI.tiers.indexOf('inherit') >= 0);
+    return !AI.tiers || AI.tiers.indexOf(m.tier) >= 0;
+  }
+  function modelKey() {
+    var k = state.settings.model;
+    if (modelAvailable(k)) return k;
+    return ['opus', 'sonnet', 'haiku'].filter(modelAvailable)[0] || 'sonnet';
+  }
+  function modelOptions(k) {
+    var m = MODELS[k];
+    return m.inherit ? { modelTier: 'inherit' } : { model: m.id, modelTier: m.tier };
+  }
+  // Кто на самом деле ответил: названная модель (modelApplied) или модель того же уровня.
+  function answeredBy(k, res) {
+    var m = MODELS[k];
+    if (m.inherit) return { name: 'модель из твоих настроек Claude', fem: true, exact: true };
+    if (res && res.modelApplied) return { name: 'Claude ' + m.label, fem: false, exact: true };
+    var t = res && TIER_NAMES[res.modelTierApplied];
+    return { name: t ? 'модель уровня ' + t : 'другая модель Claude', fem: true, exact: false };
+  }
+  function renderModelPick() {
+    var seg = $('#modelSeg');
+    if (!seg) return;
+    seg.textContent = '';
+    var cur = modelKey();
+    MODEL_ORDER.forEach(function (k) {
+      var m = MODELS[k], ok = modelAvailable(k);
+      if (m.inherit && !ok) return;
+      var b = h('button', {
+        type: 'button', role: 'radio', 'aria-checked': k === cur ? 'true' : 'false',
+        class: k === cur ? 'on' : null, disabled: ok ? null : true,
+        title: ok ? null : 'Недоступно на этой странице', dataset: { model: k }
+      }, m.label);
+      b.addEventListener('click', function () { state.settings.model = k; save(); renderModelPick(); });
+      seg.append(b);
+    });
+    $('#modelNote').textContent = MODELS[cur].note + ' Выбор действует и на ответы учителя.';
+  }
+
   var AI = {
-    sample: null, state: 'checking', ctl: null, busy: false, ticker: 0, ready: null, _resolve: null,
+    sample: null, state: 'checking', ctl: null, busy: false, ticker: 0, ready: null, _resolve: null, tiers: null,
     init: function () {
       var self = this, c = window.claude;
       this.ready = new Promise(function (resolve) { self._resolve = resolve; });
       if (!c || typeof c.use !== 'function') { this.set('off'); return; }
       Promise.resolve().then(function () { return c.use('sample'); }).then(function (s) {
         self.sample = s || null;
+        if (s && typeof s.limits === 'function') {
+          s.limits().then(function (l) {
+            self.tiers = l && Array.isArray(l.modelTiers) ? l.modelTiers : null;
+            if (self.state === 'ready') renderModelPick();
+          }, function () {});
+        }
         self.set(s ? 'ready' : 'off');
       }, function () { self.set('off'); });
     },
     set: function (st) {
       this.state = st;
       $('#teacher').hidden = st !== 'ready';
+      $('#modelPick').hidden = st !== 'ready';
+      $('#modelNote').hidden = st !== 'ready';
+      if (st === 'ready') renderModelPick();
       if (this._resolve) { this._resolve(); this._resolve = null; }
       if (!this.busy) idleStatus();
     }
@@ -1089,6 +1163,7 @@
       case 'rate_limited': return { text: e.reason === 'usage_limit' ? 'Закончился лимит Claude. Попробуй позже, а пока пройди готовый урок.' : 'Слишком много запросов подряд. Подожди минуту и попробуй снова.' };
       case 'session_expired': return { text: 'Нужно заново войти в Claude, а потом повторить запрос.' };
       case 'refused': return { text: 'Claude не стал составлять такой урок. Переформулируй задачу.' };
+      case 'truncated': return { text: 'Урок получился слишком длинным и оборвался. Попробуй ещё раз или опиши задачу проще.' };
       case 'invalid_json': case 'empty_completion': return { text: 'Урок пришёл в неправильном виде. Нажми «Составить пропись» ещё раз.' };
       case 'prompt_too_large': return { text: 'Запрос слишком длинный. Опиши задачу короче.' };
       case 'cancelled': return { text: 'Остановлено.' };
@@ -1136,6 +1211,17 @@
       'Ответь только JSON-объектом, без пояснений, с полями в таком порядке:',
       '{"title":"…","summary":"…","code":"…","notes":[{"from":1,"to":2,"title":"…","text":"…"}],"run":{"kind":"text","output":"…"},"tasks":["…"],"concepts":["…"]}'
     ].join('\n');
+  }
+
+  // Читает JSON-ответ: целиком, из блока ```json или от первой { до последней }.
+  function parseLoose(text) {
+    var t = String(text || '').trim(), m, a, b;
+    try { return JSON.parse(t); } catch (e) { /* дальше */ }
+    m = /```(?:json)?\s*\n([\s\S]*?)```/.exec(t);
+    if (m) { try { return JSON.parse(m[1]); } catch (e) { /* дальше */ } }
+    a = t.indexOf('{'); b = t.lastIndexOf('}');
+    if (a >= 0 && b > a) { try { return JSON.parse(t.slice(a, b + 1)); } catch (e) { /* нет */ } }
+    return null;
   }
 
   // Достаёт строковое поле из JSON, который ещё не дописан.
@@ -1211,9 +1297,9 @@
       $('#status').textContent = '';
       renderHead({ title: 'Составляю пропись…', summary: 'Код появится на листе карандашом, как только Claude начнёт его писать.', request: text, generated: true, concepts: [] }, true);
       Ed.showPreview('');
+      var key = modelKey();
       var opts = {
         signal: AI.ctl.signal,
-        modelTier: 'default',
         onText: function (u) {
           chars = u.text.length;
           var now = Date.now();
@@ -1226,13 +1312,18 @@
           if (c && c.value) Ed.showPreview(c.value);
         }
       };
+      Object.assign(opts, modelOptions(key));
       if (fresh) opts.cache = false;
-      AI.sample.json(lessonPrompt(text, state.settings.level), opts).then(function (data) {
+      AI.sample(lessonPrompt(text, state.settings.level), opts).then(function (res) {
+        var data = parseLoose(res.text);
+        if (!data) throw { code: res.truncated ? 'truncated' : 'invalid_json' };
         var L = normalizeLesson(data, text);
+        var by = answeredBy(key, res);
+        L.by = { name: by.name, fem: by.fem };
         state.my = [L].concat(state.my.filter(function (x) { return x.id !== L.id; })).slice(0, 20);
         save(true);
         self.finish();
-        idleStatus('Готово: пропись «' + L.title + '». Печатай поверх серых букв, а объяснения к строкам — в заметках на полях.');
+        idleStatus('Готово: пропись «' + L.title + '». ' + (by.exact ? '' : 'Выбрана модель ' + MODELS[key].label + ', но ответила ' + by.name + '. ') + 'Печатай поверх серых букв, а объяснения к строкам — в заметках на полях.');
         renderCourse();
         go('lesson-' + L.id);
       }).catch(function (e) {
@@ -1292,11 +1383,14 @@
         'Код внутри текста оформляй обратными кавычками, блоки кода — тройными. Без заголовков и таблиц. ' +
         'Если вопрос не про программирование, мягко верни разговор к уроку.\n\nКод урока:\n' + numbered + '\n\nУченик сейчас на строке ' + Ed.activeLine() + '.';
       var input = [{ role: 'user', content: intro }].concat(this.turns.slice(-6), [{ role: 'user', content: q }]);
-      AI.sample(input, {
-        modelTier: 'quick', cache: false, signal: this.ctl.signal,
+      var key = modelKey();
+      AI.sample(input, Object.assign({
+        cache: false, signal: this.ctl.signal,
         onText: function (u) { renderAnswer(a, u.text); }
-      }).then(function (res) {
+      }, modelOptions(key))).then(function (res) {
         renderAnswer(a, res.text);
+        var by = answeredBy(key, res);
+        a.append(h('p', { class: 't-by' }, (by.fem ? 'Ответила ' : 'Ответил ') + by.name));
         self.turns.push({ role: 'user', content: q }, { role: 'assistant', content: res.text });
       }).catch(function (e) {
         if (e && e.code === 'cancelled') { a.remove(); return; }
@@ -1337,7 +1431,9 @@
       var d = state.done[L.id];
       kicker.textContent = 'Урок ' + L.n + ' из ' + LESSONS.length + (d ? ' · пройден на «' + d.grade + '»' : '');
     } else {
-      kicker.textContent = writing ? 'Claude составляет пропись' : 'Урок по запросу · составил Claude';
+      var mk = MODELS[modelKey()];
+      if (writing) kicker.textContent = 'Пропись составляет Claude' + (mk.inherit ? '' : ' ' + mk.label);
+      else kicker.textContent = 'Урок по запросу · ' + (L.by ? (L.by.fem ? 'составила ' : 'составил ') + L.by.name : 'составил Claude');
     }
     $('#lTitle').textContent = L.title;
     $('#lSum').textContent = L.summary || '';
@@ -1440,7 +1536,7 @@
       });
       ul.append(h('li', { class: 'mine-item' },
         h('a', { class: 'mine-link', href: '#lesson-' + L.id }, h('span', { class: 'mine-name' }, L.title), h('span', { class: 'mine-req' }, '«' + L.request + '»')),
-        h('span', { class: 'mine-date' }, new Date(L.createdAt).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' })),
+        h('span', { class: 'mine-date' }, new Date(L.createdAt).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' }) + (L.by ? ' · ' + L.by.name : '')),
         d ? h('span', { class: 'lmark g' + d.grade }, String(d.grade)) : null,
         del
       ));
